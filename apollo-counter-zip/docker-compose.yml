@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  apollo-counter:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      - APOLLO_EMAIL=${APOLLO_EMAIL}
+      - APOLLO_PASSWORD=${APOLLO_PASSWORD}
+      - IMAP_PROVIDER=${IMAP_PROVIDER:-gmail}
+      - IMAP_PASSWORD=${IMAP_PASSWORD}
+      - PORT=3000
+      - API_SECRET=${API_SECRET}
+      - SESSION_TTL_MINUTES=${SESSION_TTL_MINUTES:-60}
+      - BROWSER_PROFILE_DIR=/data/browser-profile
+    volumes:
+      # Persist Chromium profile so Apollo trusts the device after first OTP
+      - browser-profile:/data/browser-profile
+    restart: unless-stopped
+    shm_size: '256mb'   # Required for Chromium in Docker
+
+volumes:
+  browser-profile:
+    # Named volume — survives container restarts and redeployments
+    # To reset (force OTP again): docker volume rm apollo-counter_browser-profile
