@@ -1,5 +1,5 @@
 /**
- * auth.js — Multi-account Apollo login manager
+ * session.js — Multi-account Apollo login manager
  *
  * Features:
  *  - 3 accounts, each with its own IMAP inbox for OTP
