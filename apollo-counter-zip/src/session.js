@@ -401,36 +401,47 @@ async function _solveWithCapsolver() {
 async function _solveWith2Captcha() {
   console.log('[2captcha] Solving Cloudflare Challenge...');
 
-  // 2captcha uses their v2 JSON API for CF challenges
-  // POST to /in.php with method=turnstile — sitekey is optional for pure CF challenge
-  const submitBody = JSON.stringify({
-    clientKey: TWOCAPTCHA_API_KEY,
-    task: {
-      type:       'TurnstileTaskProxyless',
-      websiteURL: APOLLO_URL,
-      websiteKey: SITE_KEY,
-    },
+  // For pure CF challenge (no visible sitekey), use /in.php with method=turnstile
+  // sitekey is omitted — 2captcha handles CF JS challenge without it
+  const params = new URLSearchParams({
+    key:     TWOCAPTCHA_API_KEY,
+    method:  'turnstile',
+    pageurl: APOLLO_URL,
+    json:    '1',
   });
+  // Only add sitekey if we have one
+  if (SITE_KEY) params.set('sitekey', SITE_KEY);
 
-  const submitRes = await httpsJsonPost('api.2captcha.com', '/createTask', submitBody);
-  if (submitRes.errorId !== 0) throw new Error(`2captcha submit failed: ${submitRes.errorDescription || submitRes.errorCode}`);
+  const submitRes = await httpsGetJson(`https://2captcha.com/in.php?${params.toString()}`);
+  if (submitRes.status !== 1) throw new Error(`2captcha submit failed: ${submitRes.request}`);
 
-  const taskId = submitRes.taskId;
+  const taskId = submitRes.request;
   console.log(`[2captcha] Task ${taskId} — polling...`);
 
   const deadline = Date.now() + 120000;
   while (Date.now() < deadline) {
     await sleep(5000);
-    const poll = await httpsJsonPost('api.2captcha.com', '/getTaskResult',
-      JSON.stringify({ clientKey: TWOCAPTCHA_API_KEY, taskId }));
-
-    if (poll.status === 'ready') {
+    const pollParams = new URLSearchParams({
+      key: TWOCAPTCHA_API_KEY, action: 'get', id: taskId, json: '1',
+    });
+    const poll = await httpsGetJson(`https://2captcha.com/res.php?${pollParams.toString()}`);
+    if (poll.status === 1) {
       console.log('[2captcha] ✓ Token ready');
-      return { token: poll.solution.token };
+      return { token: poll.request };
     }
-    if (poll.errorId !== 0) throw new Error(`2captcha error: ${poll.errorDescription || poll.errorCode}`);
+    if (poll.request !== 'CAPCHA_NOT_READY') throw new Error(`2captcha error: ${poll.request}`);
   }
   throw new Error('2captcha timed out after 120s');
+}
+
+function httpsGetJson(url) {
+  return new Promise((resolve, reject) => {
+    https.get(url, res => {
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => { try { resolve(JSON.parse(data)); } catch (_) { resolve({}); } });
+    }).on('error', reject);
+  });
 }
 
 function httpsJsonPost(hostname, path, body) {
