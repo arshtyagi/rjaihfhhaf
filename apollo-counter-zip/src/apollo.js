@@ -1,5 +1,10 @@
+/**
+ * apollo.js — Apollo search API
+ * Uses pure HTTPS (no browser/Puppeteer) — sessions managed by session.js
+ */
+
 const https = require('https');
-const { getValidSession, invalidateSession } = require('./auth');
+const { getValidSession, invalidateSession } = require('./session'); // ← fixed from './auth'
 
 // ─── Parse Apollo frontend URL → API payload ──────────────────────────────────
 function parseApolloUrl(rawUrl) {
@@ -19,21 +24,21 @@ function parseApolloUrl(rawUrl) {
   const params = new URLSearchParams(queryString);
 
   const payload = {
-    sort_by_field: params.get('sortByField') || '[none]',
-    sort_ascending: params.get('sortAscending') === 'true',
-    page: parseInt(params.get('page') || '1', 10),
-    display_mode: 'metadata_mode',
-    per_page: 30,
-    context: 'people-index-page',
-    open_factor_names: [],
+    sort_by_field:       params.get('sortByField') || '[none]',
+    sort_ascending:      params.get('sortAscending') === 'true',
+    page:                parseInt(params.get('page') || '1', 10),
+    display_mode:        'metadata_mode',
+    per_page:            30,
+    context:             'people-index-page',
+    open_factor_names:   [],
     use_pending_signals: false,
-    use_cache: false,
-    num_fetch_result: 5,
-    show_suggestions: false,
-    finder_verson: 2,
-    search_session_id: generateUuid(),
+    use_cache:           false,
+    num_fetch_result:    5,
+    show_suggestions:    false,
+    finder_verson:       2,
+    search_session_id:   generateUuid(),
     ui_finder_random_seed: Math.random().toString(36).substring(2, 13),
-    cacheKey: Date.now(),
+    cacheKey:            Date.now(),
   };
 
   // ─── Person filters ───────────────────────────────────────────────────────────
@@ -139,23 +144,19 @@ function parseApolloUrl(rawUrl) {
   return payload;
 }
 
-// ─── Apollo API call with auto re-login on auth failure ───────────────────────
-async function callApolloApi(payload, _cookies, _csrfToken) {
-  // _cookies and _csrfToken params kept for backward compatibility but ignored —
-  // we now pull fresh sessions from the auth manager automatically.
+// ─── Apollo API call — pure HTTPS, auto re-login on auth failure ──────────────
+async function callApolloApi(payload) {
   const MAX_RETRIES = 2;
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
-    // Get a valid session (auto re-logins if expired)
     const session = await getValidSession();
     const { cookies, csrfToken, account } = session;
 
     try {
-      const result = await _doApiCall(payload, cookies, csrfToken);
-      return result;
+      return await _doApiCall(payload, cookies, csrfToken);
     } catch (err) {
       if (err.authError && attempt < MAX_RETRIES) {
-        console.warn(`  [Apollo] Auth error for ${account.email}, invalidating session and retrying...`);
+        console.warn(`[Apollo] Auth error for ${account.email}, invalidating and retrying...`);
         invalidateSession(account.email);
         continue;
       }
@@ -164,35 +165,31 @@ async function callApolloApi(payload, _cookies, _csrfToken) {
   }
 }
 
+// ─── Raw HTTPS POST to Apollo search endpoint ─────────────────────────────────
 function _doApiCall(payload, cookies, csrfToken) {
   return new Promise((resolve, reject) => {
-    const body = JSON.stringify(payload);
+    const body      = JSON.stringify(payload);
+    const cookieStr = cookies.map(c => `${c.name}=${c.value}`).join('; ');
 
-    const cookieStr = cookies
-      .map(c => `${c.name}=${c.value}`)
-      .join('; ');
-
-    const options = {
+    const req = https.request({
       hostname: 'app.apollo.io',
-      path: '/api/v1/mixed_people/search_metadata_mode',
-      method: 'POST',
+      path:     '/api/v1/mixed_people/search_metadata_mode',
+      method:   'POST',
       headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(body),
-        'Accept': '*/*',
+        'Content-Type':    'application/json',
+        'Content-Length':  Buffer.byteLength(body),
+        'Accept':          '*/*',
         'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8',
-        'Origin': 'https://app.apollo.io',
-        'Referer': 'https://app.apollo.io/',
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
-        'x-csrf-token': csrfToken || '',
-        'x-referer-host': 'app.apollo.io',
-        'x-referer-path': '/people',
+        'Origin':          'https://app.apollo.io',
+        'Referer':         'https://app.apollo.io/',
+        'User-Agent':      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
+        'x-csrf-token':    csrfToken || '',
+        'x-referer-host':  'app.apollo.io',
+        'x-referer-path':  '/people',
         'x-accept-language': 'en',
-        'Cookie': cookieStr,
+        'Cookie':          cookieStr,
       },
-    };
-
-    const req = https.request(options, (res) => {
+    }, (res) => {
       let data = '';
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
@@ -203,11 +200,11 @@ function _doApiCall(payload, cookies, csrfToken) {
           ));
         }
         if (res.statusCode !== 200) {
-          return reject(new Error(`Apollo API returned HTTP ${res.statusCode}: ${data.slice(0, 200)}`));
+          return reject(new Error(`Apollo API HTTP ${res.statusCode}: ${data.slice(0, 200)}`));
         }
         try {
           resolve(JSON.parse(data));
-        } catch (e) {
+        } catch (_) {
           reject(new Error('Failed to parse Apollo response as JSON'));
         }
       });
