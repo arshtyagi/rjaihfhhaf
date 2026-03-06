@@ -126,6 +126,8 @@ function extractOtpFromEmail(emailText, emailHtml) {
       /your code[:\s]+(\d{6})/i,
       /one.time.password[:\s]+(\d{6})/i,
       /enter.+?(\d{6}).+?to/i,
+      // Apollo puts the OTP on its own line as bold text — match isolated 6-digit numbers
+      /(?:^|\s)(\d{6})(?:\s|$)/m,
       /\b([0-9]{6})\b/,              // Any standalone 6-digit number
     ];
 
@@ -146,20 +148,33 @@ function parseMessages(imap, messageIds) {
     // Fetch most recent first
     const ids = messageIds.slice(-5); // Last 5 matches max
     const fetch = imap.fetch(ids, { bodies: '' });
-    const otps = [];
+
+    // FIX: collect Promises for each message so we await them all before resolving.
+    // The original code resolved in fetch.once('end') before simpleParser callbacks
+    // had fired, because simpleParser is async — this was a race condition.
+    const parsePromises = [];
 
     fetch.on('message', (msg) => {
-      msg.on('body', (stream) => {
-        simpleParser(stream, (err, parsed) => {
-          if (err) return;
-          const otp = extractOtpFromEmail(parsed.text, parsed.html);
-          if (otp) otps.push(otp);
+      const parsePromise = new Promise((res) => {
+        msg.on('body', (stream) => {
+          simpleParser(stream, (err, parsed) => {
+            if (err) return res(null);
+            const otp = extractOtpFromEmail(parsed.text, parsed.html);
+            res(otp || null);
+          });
         });
       });
+      parsePromises.push(parsePromise);
     });
 
-    fetch.once('end', () => {
-      resolve(otps.length > 0 ? otps[otps.length - 1] : null);
+    fetch.once('end', async () => {
+      try {
+        const results = await Promise.all(parsePromises);
+        const otps = results.filter(Boolean);
+        resolve(otps.length > 0 ? otps[otps.length - 1] : null);
+      } catch (e) {
+        resolve(null);
+      }
     });
 
     fetch.once('error', reject);
