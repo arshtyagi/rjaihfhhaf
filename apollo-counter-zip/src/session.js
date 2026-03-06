@@ -424,4 +424,7 @@ function httpsJsonRequest(hostname, path, body) {
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // ─── Exports ──────────────────────────────────────────────────────────────────
-module.exports = { warmAllSessions, getValidSession, invalidateSession, loginAccount, ACCOUNTS };
+// ensureSession is an alias for getValidSession (backward compatibility)
+const ensureSession = getValidSession;
+
+module.exports = { warmAllSessions, getValidSession, ensureSession, invalidateSession, loginAccount, ACCOUNTS };
