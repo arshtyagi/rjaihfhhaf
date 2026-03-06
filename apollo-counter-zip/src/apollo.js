@@ -1,8 +1,8 @@
 const https = require('https');
+const { getValidSession, invalidateSession } = require('./auth');
 
 // ─── Parse Apollo frontend URL → API payload ──────────────────────────────────
 function parseApolloUrl(rawUrl) {
-  // Handle hash-based SPA URLs: https://app.apollo.io/#/people?...
   let queryString = '';
   const hashIdx = rawUrl.indexOf('#');
   if (hashIdx !== -1) {
@@ -18,7 +18,6 @@ function parseApolloUrl(rawUrl) {
 
   const params = new URLSearchParams(queryString);
 
-  // ─── Base payload (matches exact shape from real curl requests) ───────────────
   const payload = {
     sort_by_field: params.get('sortByField') || '[none]',
     sort_ascending: params.get('sortAscending') === 'true',
@@ -37,19 +36,16 @@ function parseApolloUrl(rawUrl) {
     cacheKey: Date.now(),
   };
 
-  // ─── Person title filters ─────────────────────────────────────────────────────
-  // Confirmed from real curls: plain string array e.g. ["owner","founder","ceo"]
+  // ─── Person filters ───────────────────────────────────────────────────────────
   const titles = params.getAll('personTitles[]');
   if (titles.length) payload.person_titles = titles;
 
   const notTitles = params.getAll('personNotTitles[]');
   if (notTitles.length) payload.person_not_titles = notTitles;
 
-  // ─── Person seniority ─────────────────────────────────────────────────────────
   const seniorities = params.getAll('personSeniorities[]');
   if (seniorities.length) payload.person_seniorities = seniorities;
 
-  // ─── Person location filters ──────────────────────────────────────────────────
   const personLocations = params.getAll('personLocations[]');
   if (personLocations.length) payload.person_locations = personLocations;
 
@@ -67,40 +63,34 @@ function parseApolloUrl(rawUrl) {
   const phoneExists = params.get('phoneExists');
   if (phoneExists !== null) payload.phone_exists = phoneExists === 'true';
 
-  // ─── Organization size ────────────────────────────────────────────────────────
+  // ─── Organization filters ─────────────────────────────────────────────────────
   const orgSizes = params.getAll('organizationNumEmployeesRanges[]');
   if (orgSizes.length) payload.organization_num_employees_ranges = orgSizes;
 
-  // ─── Organization location filters ───────────────────────────────────────────
   const orgLocations = params.getAll('organizationLocations[]');
   if (orgLocations.length) payload.organization_locations = orgLocations;
 
   const orgNotLocations = params.getAll('organizationNotLocations[]');
   if (orgNotLocations.length) payload.organization_not_locations = orgNotLocations;
 
-  // ─── Organization industry filters ───────────────────────────────────────────
   const orgIndustryTagIds = params.getAll('organizationIndustryTagIds[]');
   if (orgIndustryTagIds.length) payload.organization_industry_tag_ids = orgIndustryTagIds;
 
   const orgNotIndustryTagIds = params.getAll('organizationNotIndustryTagIds[]');
   if (orgNotIndustryTagIds.length) payload.organization_not_industry_tag_ids = orgNotIndustryTagIds;
 
-  // ─── Organization keyword tag filters ────────────────────────────────────────
-  // included_organization_keyword_fields: where keyword tags are searched (tags/name/social_media_description)
+  // ─── Keyword tag filters ──────────────────────────────────────────────────────
   const includedOrgKeywordFields = params.getAll('includedOrganizationKeywordFields[]');
   if (includedOrgKeywordFields.length) payload.included_organization_keyword_fields = includedOrgKeywordFields;
 
-  // excluded_organization_keyword_fields: where NOT keyword tags are searched
   const excludedOrgKeywordFields = params.getAll('excludedOrganizationKeywordFields[]');
   if (excludedOrgKeywordFields.length) payload.excluded_organization_keyword_fields = excludedOrgKeywordFields;
 
-  // q_organization_keyword_tags: include tags (merge qOrganizationKeywordTags[] + legacy organizationKeywordTags[])
   const qOrgKeywordTags = params.getAll('qOrganizationKeywordTags[]');
   const legacyOrgKeywordTags = params.getAll('organizationKeywordTags[]');
   const allIncludedTags = [...qOrgKeywordTags, ...legacyOrgKeywordTags];
   if (allIncludedTags.length) payload.q_organization_keyword_tags = allIncludedTags;
 
-  // q_not_organization_keyword_tags: exclude tags
   const qNotOrgKeywordTags = params.getAll('qNotOrganizationKeywordTags[]');
   if (qNotOrgKeywordTags.length) payload.q_not_organization_keyword_tags = qNotOrgKeywordTags;
 
@@ -111,51 +101,70 @@ function parseApolloUrl(rawUrl) {
   const notListId = params.get('qNotOrganizationSearchListId');
   if (notListId) payload.q_not_organization_search_list_id = notListId;
 
-  // ─── Keywords ────────────────────────────────────────────────────────────────
+  // ─── Keywords ─────────────────────────────────────────────────────────────────
   const keywords = params.get('qKeywords');
   if (keywords) payload.q_keywords = keywords;
 
   // ─── Recommendation config ────────────────────────────────────────────────────
-  // "score" is a valid value — passed through as-is
   const recConfigId = params.get('recommendationConfigId');
   if (recConfigId) payload.recommendation_config_id = recConfigId;
 
-  // ─── Finder view / table layout (seen in real curls with finder_view_id) ──────
+  // ─── Finder view / table layout ───────────────────────────────────────────────
   const finderViewId = params.get('finderViewId');
   if (finderViewId) payload.finder_view_id = finderViewId;
 
   const finderTableLayoutId = params.get('finderTableLayoutId');
   if (finderTableLayoutId) payload.finder_table_layout_id = finderTableLayoutId;
 
-  // ─── Saved search unique URL ──────────────────────────────────────────────────
+  // ─── Unique saved search URL ──────────────────────────────────────────────────
   const uniqueUrlId = params.get('uniqueUrlId');
   if (uniqueUrlId) payload.unique_url_id = uniqueUrlId;
 
-  // ─── Include similar titles toggle ───────────────────────────────────────────
+  // ─── Misc filters ─────────────────────────────────────────────────────────────
   const includeSimilarTitles = params.get('includeSimilarTitles');
   if (includeSimilarTitles !== null) payload.include_similar_titles = includeSimilarTitles === 'true';
 
-  // ─── Prospected by current team ──────────────────────────────────────────────
   const prospectedByCurrentTeam = params.getAll('prospectedByCurrentTeam[]');
   if (prospectedByCurrentTeam.length) payload.prospected_by_current_team = prospectedByCurrentTeam;
 
-  // ─── Market segments ─────────────────────────────────────────────────────────
   const marketSegments = params.getAll('marketSegments[]');
   if (marketSegments.length) payload.market_segments = marketSegments;
 
-  // ─── Revenue range ───────────────────────────────────────────────────────────
   const revenueRange = params.getAll('revenueRange[]');
   if (revenueRange.length) payload.revenue_range = revenueRange;
 
-  // ─── Technology filters ───────────────────────────────────────────────────────
   const techUids = params.getAll('currentlyUsingAnyOfTechnologyUids[]');
   if (techUids.length) payload.currently_using_any_of_technology_uids = techUids;
 
   return payload;
 }
 
-// ─── Make the actual Apollo API call ─────────────────────────────────────────
-function callApolloApi(payload, cookies, csrfToken) {
+// ─── Apollo API call with auto re-login on auth failure ───────────────────────
+async function callApolloApi(payload, _cookies, _csrfToken) {
+  // _cookies and _csrfToken params kept for backward compatibility but ignored —
+  // we now pull fresh sessions from the auth manager automatically.
+  const MAX_RETRIES = 2;
+
+  for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    // Get a valid session (auto re-logins if expired)
+    const session = await getValidSession();
+    const { cookies, csrfToken, account } = session;
+
+    try {
+      const result = await _doApiCall(payload, cookies, csrfToken);
+      return result;
+    } catch (err) {
+      if (err.authError && attempt < MAX_RETRIES) {
+        console.warn(`  [Apollo] Auth error for ${account.email}, invalidating session and retrying...`);
+        invalidateSession(account.email);
+        continue;
+      }
+      throw err;
+    }
+  }
+}
+
+function _doApiCall(payload, cookies, csrfToken) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify(payload);
 
@@ -188,7 +197,10 @@ function callApolloApi(payload, cookies, csrfToken) {
       res.on('data', chunk => data += chunk);
       res.on('end', () => {
         if (res.statusCode === 401 || res.statusCode === 403) {
-          return reject(Object.assign(new Error(`Auth failed: HTTP ${res.statusCode}`), { authError: true }));
+          return reject(Object.assign(
+            new Error(`Auth failed: HTTP ${res.statusCode}`),
+            { authError: true }
+          ));
         }
         if (res.statusCode !== 200) {
           return reject(new Error(`Apollo API returned HTTP ${res.statusCode}: ${data.slice(0, 200)}`));
