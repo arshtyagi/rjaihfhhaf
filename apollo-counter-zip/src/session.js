@@ -159,7 +159,7 @@ async function loginAccount(account) {
   console.log(`[Auth] ── Logging in account ${account.id}: ${account.email}`);
 
   // Step 1: Get seed cookies
-  const { cookies: seedCookies, csrfToken: seedCsrf } = await getSeedCookies();
+  let { cookies: seedCookies, csrfToken: seedCsrf } = await getSeedCookies();
   console.log(`[Auth]   CSRF: ${seedCsrf ? seedCsrf.slice(0, 20) + '...' : '(none)'}`);
   console.log(`[Auth]   Seed cookies: ${seedCookies.map(c => c.name).join(', ')}`);
 
@@ -177,14 +177,19 @@ async function loginAccount(account) {
     (typeof loginRes.body === 'string' && loginRes.body.includes('captcha'));
 
   if (needsCaptcha) {
-    console.log(`[Auth]   Captcha detected — solving via Capsolver...`);
-    let turnstileToken;
+    console.log(`[Auth]   Captcha detected — solving...`);
+    let solution;
     try {
-      turnstileToken = await solveTurnstile();
+      solution = await solveTurnstile();
     } catch (err) {
-      throw new Error(`Captcha required but Capsolver failed: ${err.message}`);
+      throw new Error(`Captcha required but solver failed: ${err.message}`);
     }
-    loginRes = await postLogin(account, seedCookies, seedCsrf, turnstileToken);
+    // Merge any CF cookies returned by the solver (e.g. cf_clearance)
+    if (solution.cookies && solution.cookies.length) {
+      seedCookies = mergeCookies(seedCookies, solution.cookies);
+      console.log(`[Auth]   CF cookies from solver: ${solution.cookies.map(c=>c.name).join(', ')}`);
+    }
+    loginRes = await postLogin(account, seedCookies, seedCsrf, solution.token || null);
     console.log(`[Auth]   Login (with captcha) HTTP ${loginRes.statusCode}`);
     try { responseData = JSON.parse(loginRes.body); } catch (_) {}
   }
@@ -326,38 +331,101 @@ async function fetchOtpForAccount(account) {
 }
 
 
-// ─── Capsolver: solve Turnstile (only called when captcha is detected) ────────
-const CAPSOLVER_API_KEY = process.env.CAPSOLVER_API_KEY
+// ─── Captcha solvers (only called when captcha is detected) ──────────────────
+// Tries Capsolver first, falls back to 2captcha if Capsolver fails.
+
+const CAPSOLVER_API_KEY  = process.env.CAPSOLVER_API_KEY
   || 'CAP-D3066E7DCF80005676B3C5DD6C46CA7D4A28B0A9D857CD4E0A614155F83FC499';
+const TWOCAPTCHA_API_KEY = process.env.TWOCAPTCHA_API_KEY || '';
 
+const SITE_KEY    = process.env.TURNSTILE_SITE_KEY || '0x4AAAAAAADnPIDROrmt1Wwj';
+const APOLLO_URL  = 'https://app.apollo.io';
+
+// Main entry — tries Capsolver first, falls back to 2captcha
+// Returns { token, cookies[] } — token for login body, cookies merged into seed cookies
 async function solveTurnstile() {
-  console.log('[Capsolver] Solving Turnstile...');
+  let solution = null;
 
-  // Auto-detect site key from env or use Apollo's known key
-  const siteKey = process.env.TURNSTILE_SITE_KEY || '0x4AAAAAAADnPIDROrmt1Wwj';
+  if (CAPSOLVER_API_KEY) {
+    try {
+      solution = await _solveWithCapsolver();
+    } catch (err) {
+      console.warn(`[Capsolver] Failed: ${err.message} — trying 2captcha...`);
+    }
+  }
 
-  const createBody = JSON.stringify({
+  if (!solution && TWOCAPTCHA_API_KEY) {
+    solution = await _solveWith2Captcha();
+  }
+
+  if (!solution) {
+    throw new Error('No captcha solver available. Set CAPSOLVER_API_KEY or TWOCAPTCHA_API_KEY in .env');
+  }
+
+  return solution; // { token, cookies: [{name,value},...] }
+}
+
+// ── Capsolver ─────────────────────────────────────────────────────────────────
+// Uses AntiCloudflareTask — handles both CF Challenge and Turnstile automatically
+async function _solveWithCapsolver() {
+  console.log('[Capsolver] Solving Cloudflare Challenge...');
+  const createRes = await httpsJsonPost('api.capsolver.com', '/createTask', JSON.stringify({
     clientKey: CAPSOLVER_API_KEY,
-    task: { type: 'AntiTurnstileTaskProxyLess', websiteURL: 'https://app.apollo.io', websiteKey: siteKey },
-  });
-
-  const createRes = await httpsJsonPost('api.capsolver.com', '/createTask', createBody);
-  if (createRes.errorId !== 0) throw new Error(`Capsolver: ${createRes.errorDescription}`);
+    task: {
+      type:       'AntiCloudflareTask',   // works for CF Challenge + Turnstile
+      websiteURL: APOLLO_URL,
+      websiteKey: SITE_KEY,
+      metadata:   { type: 'challenge' },  // tells Capsolver it's a JS challenge
+    },
+  }));
+  if (createRes.errorId !== 0) throw new Error(createRes.errorDescription);
 
   const { taskId } = createRes;
   const deadline = Date.now() + 120000;
-
   while (Date.now() < deadline) {
-    await sleep(3000);
+    await sleep(5000);
     const poll = await httpsJsonPost('api.capsolver.com', '/getTaskResult',
       JSON.stringify({ clientKey: CAPSOLVER_API_KEY, taskId }));
     if (poll.status === 'ready') {
-      console.log('[Capsolver] ✓ Token ready');
-      return poll.solution.token;
+      console.log('[Capsolver] ✓ CF challenge solved');
+      // AntiCloudflareTask returns cookies including cf_clearance
+      return poll.solution;
     }
-    if (poll.status === 'failed' || poll.errorId !== 0) throw new Error(`Capsolver: ${poll.errorDescription}`);
+    if (poll.status === 'failed' || poll.errorId !== 0) throw new Error(poll.errorDescription);
   }
   throw new Error('Capsolver timed out after 120s');
+}
+
+// ── 2captcha ──────────────────────────────────────────────────────────────────
+// Uses turnstile method — 2captcha handles CF challenge the same way
+async function _solveWith2Captcha() {
+  console.log('[2captcha] Solving Cloudflare Challenge...');
+
+  const submitRes = await httpsJsonPost('2captcha.com', '/in.php', JSON.stringify({
+    key:     TWOCAPTCHA_API_KEY,
+    method:  'turnstile',
+    sitekey: SITE_KEY,
+    pageurl: APOLLO_URL,
+    json:    1,
+  }));
+  if (submitRes.status !== 1) throw new Error(`2captcha submit failed: ${submitRes.request}`);
+
+  const taskId = submitRes.request;
+  console.log(`[2captcha] Task ${taskId} — polling...`);
+
+  const deadline = Date.now() + 120000;
+  while (Date.now() < deadline) {
+    await sleep(5000);
+    const poll = await httpsJsonPost('2captcha.com', '/res.php', JSON.stringify({
+      key: TWOCAPTCHA_API_KEY, action: 'get', id: taskId, json: 1,
+    }));
+    if (poll.status === 1) {
+      console.log('[2captcha] ✓ Token ready');
+      return { token: poll.request };  // normalise to same shape as Capsolver
+    }
+    if (poll.request !== 'CAPCHA_NOT_READY') throw new Error(`2captcha error: ${poll.request}`);
+  }
+  throw new Error('2captcha timed out after 120s');
 }
 
 function httpsJsonPost(hostname, path, body) {
