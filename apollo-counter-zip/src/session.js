@@ -1,273 +1,356 @@
 /**
- * session.js — manages the Apollo browser session
+ * auth.js — Multi-account Apollo login manager
  *
- * KEY DESIGN: Uses launchPersistentContext() so the Chromium profile
- * (cookies, localStorage, device trust tokens) is saved to BROWSER_PROFILE_DIR.
- * Mount that directory as a Docker volume → OTP is only needed on the very first
- * run (or if the server IP changes). Subsequent restarts reuse the trusted profile.
- *
- * Flow:
- *  1. Open persistent Chromium profile from /data/browser-profile
- *  2. Navigate to Apollo login, fill credentials
- *  3. OTP screen? → fetch from Gmail IMAP → fill it (first run only)
- *  4. Extract cookies + CSRF token → cache in memory for SESSION_TTL_MINUTES
- *  5. On expiry/401 → re-login (no OTP, device already trusted)
+ * Features:
+ *  - Multiple accounts with round-robin session usage
+ *  - Auto re-login when session expires (401/403)
+ *  - Capsolver integration for Cloudflare Turnstile / hCaptcha
+ *  - CSRF token extraction from cookies
+ *  - Persistent session storage per account
  */
 
-const { chromium } = require('playwright');
-const { fetchOtpFromEmail } = require('./imap');
+const https = require('https');
+const http = require('http');
 
-// ─── Config ───────────────────────────────────────────────────────────────────
-const PROFILE_DIR = process.env.BROWSER_PROFILE_DIR || '/data/browser-profile';
-const SESSION_TTL_MS = (parseInt(process.env.SESSION_TTL_MINUTES) || 60) * 60 * 1000;
+// ─── Account pool config ──────────────────────────────────────────────────────
+// Add 2-3 accounts here. Each will have its own independent session.
+const ACCOUNTS = [
+  {
+    email: process.env.APOLLO_EMAIL_1 || process.env.APOLLO_EMAIL,
+    password: process.env.APOLLO_PASSWORD_1 || process.env.APOLLO_PASSWORD,
+  },
+  // Uncomment and fill for additional accounts:
+  // {
+  //   email: process.env.APOLLO_EMAIL_2,
+  //   password: process.env.APOLLO_PASSWORD_2,
+  // },
+  // {
+  //   email: process.env.APOLLO_EMAIL_3,
+  //   password: process.env.APOLLO_PASSWORD_3,
+  // },
+].filter(a => a.email && a.password);
 
-// ─── State ────────────────────────────────────────────────────────────────────
-let persistentContext = null;
-let sessionCookies    = null;
-let csrfToken         = null;
-let sessionExpiresAt  = null;
-let loginInProgress   = false;
-let loginWaiters      = [];
+const CAPSOLVER_API_KEY = process.env.CAPSOLVER_API_KEY || 'CAP-D3066E7DCF80005676B3C5DD6C46CA7D4A28B0A9D857CD4E0A614155F83FC499';
 
-// ─── Persistent browser context ───────────────────────────────────────────────
-// launchPersistentContext writes cookies/localStorage to PROFILE_DIR on disk.
-// Apollo's "trusted device" flag lives in those cookies → no OTP on restart.
-async function getContext() {
-  if (persistentContext) return persistentContext;
+// Apollo Cloudflare Turnstile site key (from login page)
+const APOLLO_TURNSTILE_SITE_KEY = '0x4AAAAAAABkMYinukE8nzYS';
+const APOLLO_LOGIN_URL = 'https://app.apollo.io';
 
-  console.log(`[Browser] Opening persistent profile: ${PROFILE_DIR}`);
+// ─── In-memory session store ──────────────────────────────────────────────────
+// sessions[email] = { cookies: [...], csrfToken: '', expiresAt: Date, loggedIn: bool }
+const sessions = {};
 
-  persistentContext = await chromium.launchPersistentContext(PROFILE_DIR, {
-    headless: true,
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-blink-features=AutomationControlled',
-      '--window-size=1280,800',
-    ],
-    userAgent:
-      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ' +
-      '(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-    viewport: { width: 1280, height: 800 },
-    ignoreHTTPSErrors: true,
+// ─── Round-robin account index ────────────────────────────────────────────────
+let accountIndex = 0;
+
+// ─── Capsolver: solve Cloudflare Turnstile ────────────────────────────────────
+async function solveTurnstile() {
+  console.log('  [Capsolver] Solving Cloudflare Turnstile...');
+
+  // Step 1: Create task
+  const createTaskBody = JSON.stringify({
+    clientKey: CAPSOLVER_API_KEY,
+    task: {
+      type: 'AntiTurnstileTaskProxyLess',
+      websiteURL: APOLLO_LOGIN_URL,
+      websiteKey: APOLLO_TURNSTILE_SITE_KEY,
+    },
   });
 
-  persistentContext.on('close', () => {
-    console.log('[Browser] Context closed — will reopen on next request');
-    persistentContext = null;
-    invalidateSession();
-  });
+  const taskRes = await httpRequest({
+    hostname: 'api.capsolver.com',
+    path: '/createTask',
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(createTaskBody),
+    },
+  }, createTaskBody);
 
-  // Block media/fonts to speed up page loads
-  await persistentContext.route(
-    '**/*.{png,jpg,jpeg,gif,svg,woff,woff2,ttf,mp4,webm}',
-    r => r.abort()
-  );
-
-  return persistentContext;
-}
-
-// ─── DOM helpers ──────────────────────────────────────────────────────────────
-async function fillFirst(page, selectors, value) {
-  for (const sel of selectors) {
-    const el = await page.$(sel);
-    if (el) { await el.fill(value); return el; }
+  if (taskRes.errorId !== 0) {
+    throw new Error(`Capsolver createTask failed: ${taskRes.errorDescription}`);
   }
-  throw new Error(`Could not find input: ${selectors.join(', ')}`);
-}
 
-async function clickFirst(page, selectors) {
-  for (const sel of selectors) {
-    const el = await page.$(sel);
-    if (el) { await el.click(); return el; }
+  const taskId = taskRes.taskId;
+  console.log(`  [Capsolver] Task created: ${taskId}`);
+
+  // Step 2: Poll for result (up to 120s)
+  const deadline = Date.now() + 120000;
+  while (Date.now() < deadline) {
+    await sleep(3000);
+
+    const resultBody = JSON.stringify({ clientKey: CAPSOLVER_API_KEY, taskId });
+    const result = await httpRequest({
+      hostname: 'api.capsolver.com',
+      path: '/getTaskResult',
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(resultBody),
+      },
+    }, resultBody);
+
+    if (result.status === 'ready') {
+      console.log('  [Capsolver] ✓ Turnstile solved');
+      return result.solution.token;
+    }
+
+    if (result.status === 'failed' || result.errorId !== 0) {
+      throw new Error(`Capsolver task failed: ${result.errorDescription}`);
+    }
+
+    console.log('  [Capsolver] Waiting for solution...');
   }
-  throw new Error(`Could not find button: ${selectors.join(', ')}`);
+
+  throw new Error('Capsolver timeout: Turnstile not solved within 120s');
 }
 
-async function findFirst(page, selectors) {
-  for (const sel of selectors) {
-    const el = await page.$(sel);
-    if (el) return el;
-  }
-  return null;
-}
-
-// ─── Main login flow ──────────────────────────────────────────────────────────
-async function loginToApollo() {
-  console.log('[Login] Starting Apollo login flow...');
-  const context = await getContext();
-  const page = await context.newPage();
-
-  try {
-    // 1. Load login page
-    console.log('[Login] Navigating to login page...');
-    await page.goto('https://app.apollo.io/#/login', {
-      waitUntil: 'domcontentloaded',
-      timeout: 30000,
+// ─── Get initial cookies from Apollo login page ───────────────────────────────
+async function getInitialCookies() {
+  return new Promise((resolve, reject) => {
+    const req = https.request({
+      hostname: 'app.apollo.io',
+      path: '/',
+      method: 'GET',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      },
+    }, (res) => {
+      const rawCookies = res.headers['set-cookie'] || [];
+      const cookies = parseSetCookieHeaders(rawCookies);
+      resolve(cookies);
     });
-    await page.waitForSelector('input[type="email"], input[name="email"]', { timeout: 15000 });
-    console.log('[Login] Login form ready');
-
-    // 2. Fill credentials
-    await fillFirst(page, [
-      'input[type="email"]', 'input[name="email"]', 'input[placeholder*="email" i]',
-    ], process.env.APOLLO_EMAIL);
-
-    await fillFirst(page, [
-      'input[type="password"]', 'input[name="password"]', 'input[placeholder*="password" i]',
-    ], process.env.APOLLO_PASSWORD);
-
-    // 3. Submit
-    await clickFirst(page, [
-      'button[type="submit"]', 'button:has-text("Log In")',
-      'button:has-text("Sign In")', 'button:has-text("Continue")',
-    ]);
-    console.log('[Login] Credentials submitted');
-
-    await page.waitForTimeout(4000);
-
-    // 4. OTP check
-    // With a persistent profile + consistent server IP, this only fires on first ever run.
-    // Apollo writes a "trusted device" cookie to the profile after OTP → saved to disk.
-    const otpInput = await findFirst(page, [
-      'input[autocomplete="one-time-code"]',
-      'input[placeholder*="code" i]',
-      'input[placeholder*="otp" i]',
-      'input[placeholder*="verification" i]',
-      'input[placeholder*="6-digit" i]',
-      'input[maxlength="6"][type="text"]',
-      'input[maxlength="6"][type="number"]',
-    ]);
-
-    let otpAttempted = false;
-    if (otpInput) {
-      console.log('[Login] OTP screen detected (first run / IP changed) — fetching from Gmail...');
-      const otp = await fetchOtpFromEmail(120000);
-      await otpInput.fill(otp);
-      await page.waitForTimeout(400);
-
-      const otpSubmit = await findFirst(page, [
-        'button[type="submit"]', 'button:has-text("Verify")',
-        'button:has-text("Confirm")', 'button:has-text("Continue")',
-      ]);
-      if (otpSubmit) await otpSubmit.click();
-      else await page.keyboard.press('Enter');
-
-      otpAttempted = true;
-      console.log('[Login] OTP submitted — device will be trusted from now on');
-      await page.waitForTimeout(3000);
-    } else {
-      console.log('[Login] No OTP required (trusted device recognised ✓)');
-    }
-
-    // 5. Wait for dashboard
-    try {
-      await page.waitForURL(
-        url => /app\.apollo\.io\/#\/(people|home|accounts|contacts|sequences)/.test(url),
-        { timeout: 25000 }
-      );
-    } catch {
-      const finalUrl = page.url();
-      if (finalUrl.includes('login') || finalUrl.includes('otp') || finalUrl.includes('verify')) {
-        throw new Error(
-          `Login failed — stuck on: ${finalUrl}. ` +
-          (otpAttempted ? 'OTP may be wrong or expired.' : 'Check APOLLO_EMAIL / APOLLO_PASSWORD.')
-        );
-      }
-      console.log('[Login] URL check timed out but not on login page — continuing');
-    }
-
-    console.log('[Login] ✓ Logged in — URL:', page.url());
-
-    // 6. Extract cookies + CSRF token
-    const cookies = await context.cookies(['https://app.apollo.io']);
-
-    let csrf = null;
-    const csrfCookie = cookies.find(c =>
-      c.name === 'X-CSRF-TOKEN' || c.name === 'csrf-token' || c.name === '_csrf_token'
-    );
-    if (csrfCookie) csrf = decodeURIComponent(csrfCookie.value);
-
-    if (!csrf) {
-      csrf = await page.evaluate(() =>
-        document.querySelector('meta[name="csrf-token"]')?.content || null
-      ).catch(() => null);
-    }
-
-    if (csrf) {
-      console.log('[Login] CSRF token:', csrf.slice(0, 20) + '...');
-    } else {
-      console.warn('[Login] ⚠ CSRF token not found — API calls may return 422');
-    }
-
-    // 7. Cache session in memory
-    sessionCookies = cookies;
-    csrfToken = csrf;
-    sessionExpiresAt = Date.now() + SESSION_TTL_MS;
-
-    await page.close();
-    // Do NOT close context — it's persistent and shared across requests
-
-    console.log(`[Session] ✓ Cached for ${Math.round(SESSION_TTL_MS / 60000)} minutes`);
-
-  } catch (err) {
-    await page.close().catch(() => {});
-    throw err;
-  }
+    req.on('error', reject);
+    req.end();
+  });
 }
 
-// ─── Public API ───────────────────────────────────────────────────────────────
-async function ensureSession() {
-  const isValid =
-    sessionCookies && csrfToken &&
-    sessionExpiresAt && Date.now() < sessionExpiresAt;
+// ─── Login to Apollo ──────────────────────────────────────────────────────────
+async function loginAccount(account) {
+  console.log(`  [Auth] Logging in as ${account.email}...`);
 
-  if (isValid) {
-    const minsLeft = Math.round((sessionExpiresAt - Date.now()) / 60000);
-    console.log(`[Session] Reusing cached session (${minsLeft} min remaining)`);
-    return;
-  }
+  // 1. Get initial cookies (CSRF token seed, device ID etc.)
+  let initialCookies = await getInitialCookies();
 
-  if (loginInProgress) {
-    console.log('[Session] Login in progress — queuing request...');
-    await new Promise((resolve, reject) => loginWaiters.push({ resolve, reject }));
-    return;
-  }
+  // 2. Extract CSRF token from cookies
+  let csrfToken = cookieValue(initialCookies, 'X-CSRF-TOKEN');
 
-  loginInProgress = true;
+  // 3. Solve captcha if needed
+  let captchaToken = null;
   try {
-    await loginToApollo();
-    loginWaiters.forEach(w => w.resolve());
+    captchaToken = await solveTurnstile();
   } catch (err) {
-    loginWaiters.forEach(w => w.reject(err));
-    throw err;
-  } finally {
-    loginWaiters = [];
-    loginInProgress = false;
+    console.warn(`  [Auth] Captcha solve failed (${err.message}), attempting login without it...`);
+  }
+
+  // 4. Build login payload
+  const loginPayload = {
+    email: account.email,
+    password: account.password,
+    timezone_offset: new Date().getTimezoneOffset(),
+    cacheKey: Date.now(),
+  };
+  if (captchaToken) loginPayload.cf_turnstile_token = captchaToken;
+
+  const body = JSON.stringify(loginPayload);
+
+  const cookieStr = initialCookies.map(c => `${c.name}=${c.value}`).join('; ');
+
+  // 5. POST /api/v1/auth/login
+  const loginRes = await httpRequestFull({
+    hostname: 'app.apollo.io',
+    path: '/api/v1/auth/login',
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(body),
+      'Accept': '*/*',
+      'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8',
+      'Origin': 'https://app.apollo.io',
+      'Referer': 'https://app.apollo.io/',
+      'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36',
+      'x-csrf-token': csrfToken || '',
+      'x-referer-host': 'app.apollo.io',
+      'x-referer-path': '/login',
+      'x-accept-language': 'en',
+      'Cookie': cookieStr,
+    },
+  }, body);
+
+  if (loginRes.statusCode === 401 || loginRes.statusCode === 422) {
+    let errMsg = 'Login failed';
+    try { errMsg = JSON.parse(loginRes.body).message || errMsg; } catch (_) {}
+    throw new Error(`${errMsg} (HTTP ${loginRes.statusCode})`);
+  }
+
+  if (loginRes.statusCode !== 200) {
+    throw new Error(`Login returned HTTP ${loginRes.statusCode}: ${loginRes.body.slice(0, 200)}`);
+  }
+
+  // 6. Merge response cookies with initial cookies
+  const responseCookies = parseSetCookieHeaders(loginRes.headers['set-cookie'] || []);
+  const mergedCookies = mergeCookies(initialCookies, responseCookies);
+
+  // 7. Extract fresh CSRF token from response cookies
+  const freshCsrf = cookieValue(mergedCookies, 'X-CSRF-TOKEN') || csrfToken;
+
+  // 8. Parse session expiry from remember_token cookie (default 7 days)
+  const rememberToken = mergedCookies.find(c => c.name === 'remember_token_leadgenie_v2');
+  let expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000; // 7 days default
+  if (rememberToken?.expires) {
+    expiresAt = new Date(rememberToken.expires).getTime();
+  }
+  // Treat session as expired 10 minutes early to avoid edge cases
+  expiresAt -= 10 * 60 * 1000;
+
+  sessions[account.email] = {
+    cookies: mergedCookies,
+    csrfToken: freshCsrf,
+    expiresAt,
+    loggedIn: true,
+    account,
+  };
+
+  console.log(`  [Auth] ✓ Logged in as ${account.email} (session valid until ${new Date(expiresAt).toISOString()})`);
+  return sessions[account.email];
+}
+
+// ─── Get a valid session (auto re-login if expired) ───────────────────────────
+async function getValidSession(forceEmail = null) {
+  if (ACCOUNTS.length === 0) {
+    throw new Error('No accounts configured. Set APOLLO_EMAIL and APOLLO_PASSWORD in .env');
+  }
+
+  // If a specific email is requested, use that account
+  if (forceEmail) {
+    const account = ACCOUNTS.find(a => a.email === forceEmail);
+    if (!account) throw new Error(`Account ${forceEmail} not found in ACCOUNTS`);
+    const session = sessions[forceEmail];
+    if (session && session.loggedIn && Date.now() < session.expiresAt) {
+      return session;
+    }
+    return loginAccount(account);
+  }
+
+  // Round-robin: try each account starting from current index
+  const start = accountIndex;
+  for (let i = 0; i < ACCOUNTS.length; i++) {
+    const idx = (start + i) % ACCOUNTS.length;
+    const account = ACCOUNTS[idx];
+    const session = sessions[account.email];
+
+    if (session && session.loggedIn && Date.now() < session.expiresAt) {
+      // Advance index for next call
+      accountIndex = (idx + 1) % ACCOUNTS.length;
+      return session;
+    }
+  }
+
+  // No valid session found — log in with next account in rotation
+  const account = ACCOUNTS[accountIndex];
+  accountIndex = (accountIndex + 1) % ACCOUNTS.length;
+  return loginAccount(account);
+}
+
+// ─── Invalidate session (called on 401/403 during API calls) ─────────────────
+function invalidateSession(email) {
+  if (sessions[email]) {
+    console.log(`  [Auth] Session invalidated for ${email}, will re-login on next request`);
+    sessions[email].loggedIn = false;
+    sessions[email].expiresAt = 0;
   }
 }
 
-function getSessionData() {
-  return { cookies: sessionCookies, csrfToken };
+// ─── Pre-warm all accounts (login all upfront) ───────────────────────────────
+async function warmAllSessions() {
+  console.log(`  [Auth] Pre-warming ${ACCOUNTS.length} account session(s)...`);
+  const results = await Promise.allSettled(ACCOUNTS.map(loginAccount));
+  results.forEach((r, i) => {
+    if (r.status === 'rejected') {
+      console.error(`  [Auth] Failed to warm session for ${ACCOUNTS[i].email}: ${r.reason.message}`);
+    }
+  });
+  const ok = results.filter(r => r.status === 'fulfilled').length;
+  console.log(`  [Auth] ${ok}/${ACCOUNTS.length} sessions ready`);
 }
 
-function invalidateSession() {
-  sessionCookies = null;
-  csrfToken = null;
-  sessionExpiresAt = null;
-  console.log('[Session] Invalidated — will re-login on next request');
+// ─── Cookie helpers ───────────────────────────────────────────────────────────
+function parseSetCookieHeaders(setCookieHeaders) {
+  return setCookieHeaders.map(raw => {
+    const parts = raw.split(';').map(s => s.trim());
+    const [nameVal, ...attrs] = parts;
+    const eqIdx = nameVal.indexOf('=');
+    const name = nameVal.slice(0, eqIdx).trim();
+    const value = nameVal.slice(eqIdx + 1).trim();
+    const cookie = { name, value };
+    for (const attr of attrs) {
+      const lower = attr.toLowerCase();
+      if (lower.startsWith('expires=')) {
+        cookie.expires = attr.slice('expires='.length);
+      } else if (lower === 'httponly') {
+        cookie.httpOnly = true;
+      } else if (lower === 'secure') {
+        cookie.secure = true;
+      }
+    }
+    return cookie;
+  });
 }
 
-function getSessionStatus() {
-  if (!sessionCookies) return { active: false, reason: 'No session' };
-  if (!sessionExpiresAt || Date.now() > sessionExpiresAt) return { active: false, reason: 'Expired' };
-  return {
-    active: true,
-    expiresInMinutes: Math.round((sessionExpiresAt - Date.now()) / 60000),
-    apolloEmail: process.env.APOLLO_EMAIL,
-    profileDir: PROFILE_DIR,
-  };
+function mergeCookies(base, overrides) {
+  const map = new Map(base.map(c => [c.name, c]));
+  for (const c of overrides) map.set(c.name, c);
+  return Array.from(map.values());
 }
 
-module.exports = { ensureSession, getSessionData, invalidateSession, getSessionStatus };
+function cookieValue(cookies, name) {
+  return cookies.find(c => c.name === name)?.value || '';
+}
+
+// ─── HTTP helpers ─────────────────────────────────────────────────────────────
+function httpRequest(options, body = null) {
+  return new Promise((resolve, reject) => {
+    const lib = options.hostname?.startsWith('http://') ? http : https;
+    const req = lib.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => {
+        try { resolve(JSON.parse(data)); }
+        catch (_) { resolve(data); }
+      });
+    });
+    req.on('error', reject);
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+function httpRequestFull(options, body = null) {
+  return new Promise((resolve, reject) => {
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', chunk => data += chunk);
+      res.on('end', () => resolve({
+        statusCode: res.statusCode,
+        headers: res.headers,
+        body: data,
+      }));
+    });
+    req.on('error', reject);
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+function sleep(ms) {
+  return new Promise(r => setTimeout(r, ms));
+}
+
+module.exports = {
+  getValidSession,
+  invalidateSession,
+  warmAllSessions,
+  loginAccount,
+  ACCOUNTS,
+};
