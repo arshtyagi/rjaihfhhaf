@@ -1,29 +1,30 @@
 /**
  * session.js — Multi-account Apollo login manager
  *
- * Features:
- *  - 3 accounts, each with its own IMAP inbox for OTP
- *  - Staggered startup: account 1 logs in at t=0, account 2 at t+30min, account 3 at t+60min
- *    so sessions never all expire at the same time
- *  - Turnstile captcha solved via Capsolver on every login
- *  - Auto re-login when session expires (401/403) or within 10min of expiry
- *  - Round-robin: each search request rotates to the next ready account
+ * Login flow (pure HTTPS, no browser):
+ *  1. GET /  → collect set-cookie headers (dwndvc, zp_device_id, etc.)
+ *  2. GET /  again following Location redirect → get cf_clearance + X-CSRF-TOKEN
+ *  3. Capsolver solves Turnstile → cf_turnstile_token
+ *  4. POST /api/v1/auth/login  with all seed cookies + turnstile token
+ *  5. If otp_required → read OTP from IMAP → POST /api/v1/auth/otp_verify
+ *  6. Store merged session cookies for reuse
  */
 
 const https = require('https');
 const { fetchOtpFromEmail } = require('./imap');
 
-// ─── Capsolver config ─────────────────────────────────────────────────────────
+// ─── Config ───────────────────────────────────────────────────────────────────
 const CAPSOLVER_API_KEY = process.env.CAPSOLVER_API_KEY
   || 'CAP-D3066E7DCF80005676B3C5DD6C46CA7D4A28B0A9D857CD4E0A614155F83FC499';
 
-// Apollo's Cloudflare Turnstile site key (stable, from login page source)
-const TURNSTILE_SITE_KEY = '0x4AAAAAAABkMYinukE8nzYS';
-const APOLLO_ORIGIN     = 'https://app.apollo.io';
+// Turnstile site key — from Apollo login page HTML (data-sitekey attribute)
+// Error 110200 means wrong key — Apollo uses this key on app.apollo.io
+const TURNSTILE_SITE_KEY = '0x4AAAAAAA3bJHSNYMxIAp-0';
+const APOLLO_ORIGIN      = 'https://app.apollo.io';
+
+const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36';
 
 // ─── Account pool ─────────────────────────────────────────────────────────────
-// Each account has its own Apollo credentials + its own IMAP inbox for OTP emails.
-// IMAP config mirrors imap.js but is per-account so each Gmail reads its own inbox.
 const ACCOUNTS = [
   {
     id: 1,
@@ -31,9 +32,9 @@ const ACCOUNTS = [
     password: process.env.APOLLO_PASSWORD_1 || process.env.APOLLO_PASSWORD,
     imap: {
       provider: process.env.IMAP_PROVIDER_1 || process.env.IMAP_PROVIDER || 'gmail',
-      password: process.env.IMAP_PASSWORD_1 || process.env.IMAP_PASSWORD || process.env.GMAIL_APP_PASSWORD_1,
-      host:     process.env.IMAP_HOST_1     || null,
-      port:     process.env.IMAP_PORT_1     || 993,
+      password: process.env.IMAP_PASSWORD_1 || process.env.IMAP_PASSWORD,
+      host:     process.env.IMAP_HOST_1 || null,
+      port:     parseInt(process.env.IMAP_PORT_1 || '993', 10),
     },
   },
   {
@@ -42,9 +43,9 @@ const ACCOUNTS = [
     password: process.env.APOLLO_PASSWORD_2,
     imap: {
       provider: process.env.IMAP_PROVIDER_2 || 'gmail',
-      password: process.env.IMAP_PASSWORD_2 || process.env.GMAIL_APP_PASSWORD_2,
-      host:     process.env.IMAP_HOST_2     || null,
-      port:     process.env.IMAP_PORT_2     || 993,
+      password: process.env.IMAP_PASSWORD_2,
+      host:     process.env.IMAP_HOST_2 || null,
+      port:     parseInt(process.env.IMAP_PORT_2 || '993', 10),
     },
   },
   {
@@ -53,69 +54,52 @@ const ACCOUNTS = [
     password: process.env.APOLLO_PASSWORD_3,
     imap: {
       provider: process.env.IMAP_PROVIDER_3 || 'gmail',
-      password: process.env.IMAP_PASSWORD_3 || process.env.GMAIL_APP_PASSWORD_3,
-      host:     process.env.IMAP_HOST_3     || null,
-      port:     process.env.IMAP_PORT_3     || 993,
+      password: process.env.IMAP_PASSWORD_3,
+      host:     process.env.IMAP_HOST_3 || null,
+      port:     parseInt(process.env.IMAP_PORT_3 || '993', 10),
     },
   },
 ].filter(a => a.email && a.password);
 
 // ─── Session store ────────────────────────────────────────────────────────────
-// sessions[email] = { cookies, csrfToken, expiresAt, loggedIn, account }
 const sessions = {};
-
-// Round-robin pointer
 let rrIndex = 0;
 
 // ─── Staggered warm-up ────────────────────────────────────────────────────────
-// Call this once at app startup.
-// Account 1 logs in immediately, account 2 after 30 min, account 3 after 60 min.
-// This ensures sessions expire at different times so there's always one ready.
 async function warmAllSessions() {
-  if (ACCOUNTS.length === 0) {
-    throw new Error('No Apollo accounts configured. Check your .env file.');
-  }
+  if (ACCOUNTS.length === 0) throw new Error('No Apollo accounts in .env');
 
-  const STAGGER_MS = 30 * 60 * 1000; // 30 minutes
+  console.log(`[Auth] Warming ${ACCOUNTS.length} account(s) — 30 min stagger between each`);
 
-  console.log(`[Auth] Warming ${ACCOUNTS.length} account(s) with 30-min stagger...`);
-
-  // Login account 1 immediately (synchronously, so it's ready before we return)
+  // Account 1 — login now, block until ready
   await loginAccount(ACCOUNTS[0]).catch(e =>
-    console.error(`[Auth] Account 1 warm-up failed: ${e.message}`)
+    console.error(`[Auth] Account 1 failed: ${e.message}`)
   );
 
-  // Schedule accounts 2 and 3 in the background — they'll be ready before their
-  // sessions are actually needed (assuming requests start coming in immediately)
+  // Accounts 2 & 3 — staggered in background
   for (let i = 1; i < ACCOUNTS.length; i++) {
-    const delay = i * STAGGER_MS;
+    const delay = i * 30 * 60 * 1000;
     const acc = ACCOUNTS[i];
-    console.log(`[Auth] Account ${acc.id} scheduled to login in ${delay / 60000} min`);
+    console.log(`[Auth] Account ${acc.id} will login in ${i * 30} min`);
     setTimeout(async () => {
-      try {
-        await loginAccount(acc);
-      } catch (e) {
-        console.error(`[Auth] Account ${acc.id} staggered login failed: ${e.message}`);
-      }
-    }, delay).unref(); // .unref() so the timer doesn't block process exit
+      try { await loginAccount(acc); }
+      catch (e) { console.error(`[Auth] Account ${acc.id} failed: ${e.message}`); }
+    }, delay).unref();
   }
 
-  console.log('[Auth] Account 1 is ready. Accounts 2/3 will log in in background.');
+  console.log('[Auth] Account 1 ready. Others scheduled.');
 }
 
-// ─── Get a ready session (round-robin, auto re-login) ─────────────────────────
+// ─── Get a valid session (round-robin) ────────────────────────────────────────
 async function getValidSession(forceEmail = null) {
-  if (ACCOUNTS.length === 0) {
-    throw new Error('No accounts configured.');
-  }
+  if (ACCOUNTS.length === 0) throw new Error('No accounts configured');
 
   if (forceEmail) {
     const acc = ACCOUNTS.find(a => a.email === forceEmail);
-    if (!acc) throw new Error(`Account ${forceEmail} not in pool`);
+    if (!acc) throw new Error(`Account ${forceEmail} not found`);
     return _ensureSession(acc);
   }
 
-  // Try accounts in round-robin order, pick first one that has a valid session
   for (let i = 0; i < ACCOUNTS.length; i++) {
     const idx = (rrIndex + i) % ACCOUNTS.length;
     const acc = ACCOUNTS[idx];
@@ -126,7 +110,6 @@ async function getValidSession(forceEmail = null) {
     }
   }
 
-  // No ready session — use the next account and log in now
   const acc = ACCOUNTS[rrIndex % ACCOUNTS.length];
   rrIndex = (rrIndex + 1) % ACCOUNTS.length;
   return _ensureSession(acc);
@@ -138,10 +121,9 @@ async function _ensureSession(account) {
   return loginAccount(account);
 }
 
-// ─── Invalidate (called on 401/403) ──────────────────────────────────────────
 function invalidateSession(email) {
   if (sessions[email]) {
-    console.log(`[Auth] Invalidating session for ${email}`);
+    console.log(`[Auth] Session invalidated: ${email}`);
     sessions[email].loggedIn = false;
     sessions[email].expiresAt = 0;
   }
@@ -149,27 +131,30 @@ function invalidateSession(email) {
 
 // ─── Full login flow ──────────────────────────────────────────────────────────
 async function loginAccount(account) {
-  console.log(`\n[Auth] ── Logging in account ${account.id}: ${account.email}`);
+  console.log(`[Auth] ── Logging in account ${account.id}: ${account.email}`);
 
-  // Step 1: Load the login page to get seed cookies + CSRF token
-  const { cookies: seedCookies, csrfToken: seedCsrf } = await getSeedCookies();
-  console.log(`[Auth]   Seed CSRF: ${seedCsrf ? seedCsrf.slice(0, 20) + '...' : '(none)'}`);
+  // Step 1: Load Apollo homepage — follow up to 3 redirects, collect all cookies
+  // This gives us: dwndvc, zp_device_id, __cf_bm, cf_clearance, X-CSRF-TOKEN
+  const { cookies: seedCookies, csrfToken: seedCsrf } = await loadApolloHomepage();
+  console.log(`[Auth]   Seed CSRF: ${seedCsrf ? seedCsrf.slice(0, 20) + '...' : '(none — CF may have blocked)'}`);
 
-  // Step 2: Solve Turnstile captcha via Capsolver
+  // Step 2: Solve Turnstile
   let turnstileToken = null;
   try {
     turnstileToken = await solveTurnstile();
   } catch (err) {
-    console.warn(`[Auth]   Turnstile failed (${err.message}), proceeding without token`);
+    console.warn(`[Auth]   Turnstile failed: ${err.message}`);
+    // Without turnstile Apollo will 403 — re-throw so we don't waste the attempt
+    throw new Error(`Cannot login without Turnstile token: ${err.message}`);
   }
 
-  // Step 3: POST login
+  // Step 3: POST /api/v1/auth/login
   const loginBody = JSON.stringify({
-    email:            account.email,
-    password:         account.password,
-    timezone_offset:  new Date().getTimezoneOffset(),
-    cacheKey:         Date.now(),
-    ...(turnstileToken ? { cf_turnstile_token: turnstileToken } : {}),
+    email:           account.email,
+    password:        account.password,
+    timezone_offset: new Date().getTimezoneOffset(),
+    cacheKey:        Date.now(),
+    cf_turnstile_token: turnstileToken,
   });
 
   const loginRes = await httpsRequestFull({
@@ -177,119 +162,162 @@ async function loginAccount(account) {
     path:     '/api/v1/auth/login',
     method:   'POST',
     headers: {
-      'Content-Type':    'application/json',
-      'Content-Length':  Buffer.byteLength(loginBody),
-      'Accept':          '*/*',
-      'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8',
-      'Origin':          'https://app.apollo.io',
-      'Referer':         'https://app.apollo.io/',
-      'User-Agent':      UA,
-      'x-csrf-token':    seedCsrf || '',
-      'x-referer-host':  'app.apollo.io',
-      'x-referer-path':  '/login',
+      'Content-Type':      'application/json',
+      'Content-Length':    Buffer.byteLength(loginBody),
+      'Accept':            '*/*',
+      'Accept-Language':   'en-GB,en-US;q=0.9,en;q=0.8',
+      'Origin':            'https://app.apollo.io',
+      'Referer':           'https://app.apollo.io/',
+      'User-Agent':        UA,
+      'x-csrf-token':      seedCsrf || '',
+      'x-referer-host':    'app.apollo.io',
+      'x-referer-path':    '/login',
       'x-accept-language': 'en',
-      'Cookie':          cookiesToString(seedCookies),
+      'Cookie':            cookiesToString(seedCookies),
     },
   }, loginBody);
 
-  console.log(`[Auth]   Login response: HTTP ${loginRes.statusCode}`);
+  console.log(`[Auth]   Login HTTP ${loginRes.statusCode}`);
 
-  // Step 4: Check if OTP is required (Apollo sends 200 with otp_required flag)
   let responseData = {};
   try { responseData = JSON.parse(loginRes.body); } catch (_) {}
 
-  // Merge cookies from login response
+  if (loginRes.statusCode === 403) {
+    throw new Error(`Login blocked by Cloudflare (403). CF clearance missing or Turnstile rejected.`);
+  }
+  if (loginRes.statusCode === 401 || loginRes.statusCode === 422) {
+    throw new Error(`Login failed (${loginRes.statusCode}): ${responseData.message || 'wrong credentials'}`);
+  }
+  if (loginRes.statusCode !== 200) {
+    throw new Error(`Login failed HTTP ${loginRes.statusCode}: ${loginRes.body.slice(0, 300)}`);
+  }
+
+  // Merge response cookies
   let cookies = mergeCookies(
     seedCookies,
     parseSetCookieHeaders(loginRes.headers['set-cookie'] || [])
   );
   let csrfToken = cookieValue(cookies, 'X-CSRF-TOKEN') || seedCsrf;
 
-  if (loginRes.statusCode === 200 && responseData.otp_required) {
-    console.log(`[Auth]   OTP required — fetching from IMAP (${account.email})...`);
+  // Step 4: OTP if required
+  if (responseData.otp_required) {
+    console.log(`[Auth]   OTP required — reading from IMAP (${account.email})...`);
 
-    // Override IMAP env vars temporarily for this account's inbox
-    const origEmail    = process.env.APOLLO_EMAIL;
-    const origProvider = process.env.IMAP_PROVIDER;
-    const origPassword = process.env.IMAP_PASSWORD;
-    const origHost     = process.env.IMAP_HOST;
-    const origPort     = process.env.IMAP_PORT;
+    const otp = await fetchOtpForAccount(account);
+    console.log(`[Auth]   OTP obtained: ${otp}`);
 
-    process.env.APOLLO_EMAIL    = account.email;
-    process.env.IMAP_PROVIDER   = account.imap.provider;
-    process.env.IMAP_PASSWORD   = account.imap.password;
-    if (account.imap.host) process.env.IMAP_HOST = account.imap.host;
-    if (account.imap.port) process.env.IMAP_PORT = String(account.imap.port);
-
-    let otp;
-    try {
-      otp = await fetchOtpFromEmail(120000);
-    } finally {
-      // Restore
-      process.env.APOLLO_EMAIL    = origEmail;
-      process.env.IMAP_PROVIDER   = origProvider;
-      process.env.IMAP_PASSWORD   = origPassword;
-      if (origHost) process.env.IMAP_HOST = origHost; else delete process.env.IMAP_HOST;
-      if (origPort) process.env.IMAP_PORT = origPort; else delete process.env.IMAP_PORT;
-    }
-
-    // Submit OTP
     const otpBody = JSON.stringify({ otp_code: otp, cacheKey: Date.now() });
     const otpRes  = await httpsRequestFull({
       hostname: 'app.apollo.io',
       path:     '/api/v1/auth/otp_verify',
       method:   'POST',
       headers: {
-        'Content-Type':    'application/json',
-        'Content-Length':  Buffer.byteLength(otpBody),
-        'Accept':          '*/*',
-        'Origin':          'https://app.apollo.io',
-        'Referer':         'https://app.apollo.io/',
-        'User-Agent':      UA,
-        'x-csrf-token':    csrfToken,
-        'x-referer-host':  'app.apollo.io',
-        'x-referer-path':  '/login',
+        'Content-Type':      'application/json',
+        'Content-Length':    Buffer.byteLength(otpBody),
+        'Accept':            '*/*',
+        'Origin':            'https://app.apollo.io',
+        'Referer':           'https://app.apollo.io/',
+        'User-Agent':        UA,
+        'x-csrf-token':      csrfToken,
+        'x-referer-host':    'app.apollo.io',
+        'x-referer-path':    '/login',
         'x-accept-language': 'en',
-        'Cookie':          cookiesToString(cookies),
+        'Cookie':            cookiesToString(cookies),
       },
     }, otpBody);
 
-    console.log(`[Auth]   OTP verify response: HTTP ${otpRes.statusCode}`);
+    console.log(`[Auth]   OTP verify HTTP ${otpRes.statusCode}`);
+    if (otpRes.statusCode !== 200) throw new Error(`OTP verify failed: HTTP ${otpRes.statusCode}`);
 
-    if (otpRes.statusCode !== 200) {
-      throw new Error(`OTP verification failed: HTTP ${otpRes.statusCode}`);
-    }
-
-    // Merge OTP response cookies
-    cookies = mergeCookies(
-      cookies,
-      parseSetCookieHeaders(otpRes.headers['set-cookie'] || [])
-    );
-    csrfToken = cookieValue(cookies, 'X-CSRF-TOKEN') || csrfToken;
-
-  } else if (loginRes.statusCode !== 200) {
-    const msg = responseData.message || loginRes.body.slice(0, 200);
-    throw new Error(`Login failed HTTP ${loginRes.statusCode}: ${msg}`);
+    cookies    = mergeCookies(cookies, parseSetCookieHeaders(otpRes.headers['set-cookie'] || []));
+    csrfToken  = cookieValue(cookies, 'X-CSRF-TOKEN') || csrfToken;
   }
 
-  // Step 5: Determine session expiry from remember_token cookie
+  // Step 5: Store session
   const rememberCookie = cookies.find(c => c.name === 'remember_token_leadgenie_v2');
-  let expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000; // fallback: 7 days
+  let expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000;
   if (rememberCookie?.expires) {
-    const parsed = new Date(rememberCookie.expires).getTime();
-    if (!isNaN(parsed)) expiresAt = parsed;
+    const p = new Date(rememberCookie.expires).getTime();
+    if (!isNaN(p)) expiresAt = p;
   }
-  expiresAt -= 10 * 60 * 1000; // expire 10 min early
+  expiresAt -= 10 * 60 * 1000; // 10 min buffer
 
   sessions[account.email] = { cookies, csrfToken, expiresAt, loggedIn: true, account };
-
-  console.log(`[Auth] ✓ Account ${account.id} (${account.email}) logged in — session until ${new Date(expiresAt).toISOString()}\n`);
+  console.log(`[Auth] ✓ Account ${account.id} ready — expires ${new Date(expiresAt).toISOString()}`);
   return sessions[account.email];
 }
 
-// ─── Capsolver: solve Cloudflare Turnstile ────────────────────────────────────
+// ─── Load Apollo homepage following redirects to get CF cookies ───────────────
+// Apollo's homepage goes through Cloudflare which sets cf_clearance via JS challenge.
+// We make TWO requests: first gets __cf_bm + redirect, second (to /login) gets
+// the actual CSRF token that's set after CF validates the session.
+async function loadApolloHomepage() {
+  let allCookies = [];
+
+  // Request 1: GET / — gets dwndvc, zp_device_id, __cf_bm
+  const res1 = await httpsRequestFull({
+    hostname: 'app.apollo.io',
+    path:     '/',
+    method:   'GET',
+    headers: {
+      'User-Agent':      UA,
+      'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8',
+    },
+  });
+  allCookies = mergeCookies(allCookies, parseSetCookieHeaders(res1.headers['set-cookie'] || []));
+
+  // Request 2: GET /login — gets X-CSRF-TOKEN (set after CF passes the request)
+  const res2 = await httpsRequestFull({
+    hostname: 'app.apollo.io',
+    path:     '/',
+    method:   'GET',
+    headers: {
+      'User-Agent':      UA,
+      'Accept':          'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-GB,en-US;q=0.9,en;q=0.8',
+      'Referer':         'https://app.apollo.io/',
+      'Cookie':          cookiesToString(allCookies),
+    },
+  });
+  allCookies = mergeCookies(allCookies, parseSetCookieHeaders(res2.headers['set-cookie'] || []));
+
+  const csrfToken = cookieValue(allCookies, 'X-CSRF-TOKEN');
+  return { cookies: allCookies, csrfToken };
+}
+
+// ─── Fetch OTP using this account's own IMAP config ──────────────────────────
+async function fetchOtpForAccount(account) {
+  // Swap env vars to point imap.js at the correct inbox for this account
+  const saved = {
+    APOLLO_EMAIL:  process.env.APOLLO_EMAIL,
+    IMAP_PROVIDER: process.env.IMAP_PROVIDER,
+    IMAP_PASSWORD: process.env.IMAP_PASSWORD,
+    IMAP_HOST:     process.env.IMAP_HOST,
+    IMAP_PORT:     process.env.IMAP_PORT,
+  };
+
+  process.env.APOLLO_EMAIL  = account.email;
+  process.env.IMAP_PROVIDER = account.imap.provider;
+  process.env.IMAP_PASSWORD = account.imap.password;
+  if (account.imap.host) process.env.IMAP_HOST = account.imap.host;
+  else delete process.env.IMAP_HOST;
+  process.env.IMAP_PORT = String(account.imap.port || 993);
+
+  try {
+    return await fetchOtpFromEmail(120000);
+  } finally {
+    process.env.APOLLO_EMAIL  = saved.APOLLO_EMAIL;
+    process.env.IMAP_PROVIDER = saved.IMAP_PROVIDER;
+    process.env.IMAP_PASSWORD = saved.IMAP_PASSWORD;
+    if (saved.IMAP_HOST) process.env.IMAP_HOST = saved.IMAP_HOST; else delete process.env.IMAP_HOST;
+    if (saved.IMAP_PORT) process.env.IMAP_PORT = saved.IMAP_PORT; else delete process.env.IMAP_PORT;
+  }
+}
+
+// ─── Capsolver: Cloudflare Turnstile ─────────────────────────────────────────
 async function solveTurnstile() {
-  console.log('[Capsolver] Solving Turnstile...');
+  console.log('[Capsolver] Creating Turnstile task...');
 
   const createBody = JSON.stringify({
     clientKey: CAPSOLVER_API_KEY,
@@ -300,54 +328,30 @@ async function solveTurnstile() {
     },
   });
 
-  const createRes = await httpsJsonRequest('api.capsolver.com', '/createTask', createBody);
+  const createRes = await httpsJsonPost('api.capsolver.com', '/createTask', createBody);
   if (createRes.errorId !== 0) {
-    throw new Error(`Capsolver createTask error: ${createRes.errorDescription}`);
+    throw new Error(`Capsolver createTask failed: ${createRes.errorDescription}`);
   }
 
-  const taskId = createRes.taskId;
-  const deadline = Date.now() + 120000;
+  const { taskId } = createRes;
+  console.log(`[Capsolver] Task ${taskId} — polling...`);
 
+  const deadline = Date.now() + 120000;
   while (Date.now() < deadline) {
     await sleep(3000);
     const pollBody = JSON.stringify({ clientKey: CAPSOLVER_API_KEY, taskId });
-    const pollRes  = await httpsJsonRequest('api.capsolver.com', '/getTaskResult', pollBody);
+    const poll = await httpsJsonPost('api.capsolver.com', '/getTaskResult', pollBody);
 
-    if (pollRes.status === 'ready') {
-      console.log('[Capsolver] ✓ Turnstile token obtained');
-      return pollRes.solution.token;
+    if (poll.status === 'ready') {
+      console.log('[Capsolver] ✓ Token ready');
+      return poll.solution.token;
     }
-    if (pollRes.status === 'failed' || pollRes.errorId !== 0) {
-      throw new Error(`Capsolver task failed: ${pollRes.errorDescription}`);
+    if (poll.status === 'failed' || poll.errorId !== 0) {
+      throw new Error(`Capsolver task failed: ${poll.errorDescription}`);
     }
+    process.stdout.write('.');
   }
-
   throw new Error('Capsolver timed out after 120s');
-}
-
-// ─── Get seed cookies from Apollo homepage ────────────────────────────────────
-function getSeedCookies() {
-  return new Promise((resolve, reject) => {
-    const req = https.request({
-      hostname: 'app.apollo.io',
-      path:     '/',
-      method:   'GET',
-      headers: {
-        'User-Agent': UA,
-        'Accept':     'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      },
-    }, (res) => {
-      // Drain the body (required so the socket is released)
-      res.resume();
-      res.on('end', () => {
-        const cookies = parseSetCookieHeaders(res.headers['set-cookie'] || []);
-        const csrfToken = cookieValue(cookies, 'X-CSRF-TOKEN');
-        resolve({ cookies, csrfToken });
-      });
-    });
-    req.on('error', reject);
-    req.end();
-  });
 }
 
 // ─── Cookie helpers ───────────────────────────────────────────────────────────
@@ -359,8 +363,7 @@ function parseSetCookieHeaders(headers) {
     const value = parts[0].slice(eqIdx + 1).trim();
     const cookie = { name, value };
     for (const attr of parts.slice(1)) {
-      const lo = attr.toLowerCase();
-      if (lo.startsWith('expires=')) cookie.expires = attr.slice(8);
+      if (attr.toLowerCase().startsWith('expires=')) cookie.expires = attr.slice(8);
     }
     return cookie;
   });
@@ -381,8 +384,6 @@ function cookiesToString(cookies) {
 }
 
 // ─── HTTP helpers ─────────────────────────────────────────────────────────────
-const UA = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36';
-
 function httpsRequestFull(options, body = null) {
   return new Promise((resolve, reject) => {
     const req = https.request(options, res => {
@@ -396,24 +397,18 @@ function httpsRequestFull(options, body = null) {
   });
 }
 
-function httpsJsonRequest(hostname, path, body) {
-  const opts = {
-    hostname,
-    path,
-    method: 'POST',
-    headers: {
-      'Content-Type':   'application/json',
-      'Content-Length': Buffer.byteLength(body),
-    },
-  };
+function httpsJsonPost(hostname, path, body) {
   return new Promise((resolve, reject) => {
-    const req = https.request(opts, res => {
+    const req = https.request({
+      hostname, path, method: 'POST',
+      headers: {
+        'Content-Type':   'application/json',
+        'Content-Length': Buffer.byteLength(body),
+      },
+    }, res => {
       let data = '';
       res.on('data', c => data += c);
-      res.on('end', () => {
-        try { resolve(JSON.parse(data)); }
-        catch (_) { resolve({}); }
-      });
+      res.on('end', () => { try { resolve(JSON.parse(data)); } catch (_) { resolve({}); } });
     });
     req.on('error', reject);
     req.write(body);
@@ -424,7 +419,13 @@ function httpsJsonRequest(hostname, path, body) {
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 // ─── Exports ──────────────────────────────────────────────────────────────────
-// ensureSession is an alias for getValidSession (backward compatibility)
-const ensureSession = getValidSession;
+const ensureSession = getValidSession; // backward-compat alias
 
-module.exports = { warmAllSessions, getValidSession, ensureSession, invalidateSession, loginAccount, ACCOUNTS };
+module.exports = {
+  warmAllSessions,
+  getValidSession,
+  ensureSession,
+  invalidateSession,
+  loginAccount,
+  ACCOUNTS,
+};
