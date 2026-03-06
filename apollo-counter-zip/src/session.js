@@ -401,29 +401,34 @@ async function _solveWithCapsolver() {
 async function _solveWith2Captcha() {
   console.log('[2captcha] Solving Cloudflare Challenge...');
 
-  const submitRes = await httpsJsonPost('2captcha.com', '/in.php', JSON.stringify({
-    key:     TWOCAPTCHA_API_KEY,
-    method:  'turnstile',
-    sitekey: SITE_KEY,
-    pageurl: APOLLO_URL,
-    json:    1,
-  }));
-  if (submitRes.status !== 1) throw new Error(`2captcha submit failed: ${submitRes.request}`);
+  // 2captcha uses their v2 JSON API for CF challenges
+  // POST to /in.php with method=turnstile — sitekey is optional for pure CF challenge
+  const submitBody = JSON.stringify({
+    clientKey: TWOCAPTCHA_API_KEY,
+    task: {
+      type:       'TurnstileTaskProxyless',
+      websiteURL: APOLLO_URL,
+      websiteKey: SITE_KEY,
+    },
+  });
 
-  const taskId = submitRes.request;
+  const submitRes = await httpsJsonPost('api.2captcha.com', '/createTask', submitBody);
+  if (submitRes.errorId !== 0) throw new Error(`2captcha submit failed: ${submitRes.errorDescription || submitRes.errorCode}`);
+
+  const taskId = submitRes.taskId;
   console.log(`[2captcha] Task ${taskId} — polling...`);
 
   const deadline = Date.now() + 120000;
   while (Date.now() < deadline) {
     await sleep(5000);
-    const poll = await httpsJsonPost('2captcha.com', '/res.php', JSON.stringify({
-      key: TWOCAPTCHA_API_KEY, action: 'get', id: taskId, json: 1,
-    }));
-    if (poll.status === 1) {
+    const poll = await httpsJsonPost('api.2captcha.com', '/getTaskResult',
+      JSON.stringify({ clientKey: TWOCAPTCHA_API_KEY, taskId }));
+
+    if (poll.status === 'ready') {
       console.log('[2captcha] ✓ Token ready');
-      return { token: poll.request };  // normalise to same shape as Capsolver
+      return { token: poll.solution.token };
     }
-    if (poll.request !== 'CAPCHA_NOT_READY') throw new Error(`2captcha error: ${poll.request}`);
+    if (poll.errorId !== 0) throw new Error(`2captcha error: ${poll.errorDescription || poll.errorCode}`);
   }
   throw new Error('2captcha timed out after 120s');
 }
