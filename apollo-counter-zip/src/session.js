@@ -121,55 +121,76 @@ function invalidateSession(email) {
 }
 
 // ─── Full login flow ──────────────────────────────────────────────────────────
-async function loginAccount(account) {
-  console.log(`[Auth] ── Logging in account ${account.id}: ${account.email}`);
-
-  // Step 1: Get seed cookies (2 GETs to accumulate CF + CSRF cookies)
-  const { cookies: seedCookies, csrfToken: seedCsrf } = await getSeedCookies();
-  console.log(`[Auth]   CSRF: ${seedCsrf ? seedCsrf.slice(0, 20) + '...' : '(none)'}`);
-  console.log(`[Auth]   Seed cookies: ${seedCookies.map(c => c.name).join(', ')}`);
-
-  // Step 2: POST login — exactly matching real curl payload
-  const loginBody = JSON.stringify({
+// ─── Helper: POST login with optional captcha token ──────────────────────────
+async function postLogin(account, cookies, csrfToken, turnstileToken) {
+  const bodyObj = {
     email:           account.email,
     password:        account.password,
     timezone_offset: new Date().getTimezoneOffset(),
     cacheKey:        Date.now(),
-  });
-
-  const loginRes = await httpsRequestFull({
+  };
+  if (turnstileToken) bodyObj.cf_turnstile_token = turnstileToken;
+  const body = JSON.stringify(bodyObj);
+  return httpsRequestFull({
     hostname: 'app.apollo.io',
     path:     '/api/v1/auth/login',
     method:   'POST',
     headers: {
       'Content-Type':      'application/json',
-      'Content-Length':    Buffer.byteLength(loginBody),
+      'Content-Length':    Buffer.byteLength(body),
       'Accept':            '*/*',
       'Accept-Language':   'en-GB,en-US;q=0.9,en;q=0.8',
       'Origin':            'https://app.apollo.io',
       'Referer':           'https://app.apollo.io/',
       'User-Agent':        UA,
-      'x-csrf-token':      seedCsrf || '',
+      'x-csrf-token':      csrfToken || '',
       'x-referer-host':    'app.apollo.io',
       'x-referer-path':    '/login',
       'x-accept-language': 'en',
       'sec-fetch-dest':    'empty',
       'sec-fetch-mode':    'cors',
       'sec-fetch-site':    'same-origin',
-      'Cookie':            cookiesToString(seedCookies),
+      'Cookie':            cookiesToString(cookies),
     },
-  }, loginBody);
+  }, body);
+}
 
+async function loginAccount(account) {
+  console.log(`[Auth] ── Logging in account ${account.id}: ${account.email}`);
+
+  // Step 1: Get seed cookies
+  const { cookies: seedCookies, csrfToken: seedCsrf } = await getSeedCookies();
+  console.log(`[Auth]   CSRF: ${seedCsrf ? seedCsrf.slice(0, 20) + '...' : '(none)'}`);
+  console.log(`[Auth]   Seed cookies: ${seedCookies.map(c => c.name).join(', ')}`);
+
+  // Step 2: Try login without captcha first (normal case)
+  let loginRes = await postLogin(account, seedCookies, seedCsrf, null);
   console.log(`[Auth]   Login HTTP ${loginRes.statusCode}`);
 
   let responseData = {};
   try { responseData = JSON.parse(loginRes.body); } catch (_) {}
 
+  // If captcha is needed, solve it and retry once
+  const needsCaptcha =
+    loginRes.statusCode === 403 ||
+    responseData.captcha_required ||
+    (typeof loginRes.body === 'string' && loginRes.body.includes('captcha'));
+
+  if (needsCaptcha) {
+    console.log(`[Auth]   Captcha detected — solving via Capsolver...`);
+    let turnstileToken;
+    try {
+      turnstileToken = await solveTurnstile();
+    } catch (err) {
+      throw new Error(`Captcha required but Capsolver failed: ${err.message}`);
+    }
+    loginRes = await postLogin(account, seedCookies, seedCsrf, turnstileToken);
+    console.log(`[Auth]   Login (with captcha) HTTP ${loginRes.statusCode}`);
+    try { responseData = JSON.parse(loginRes.body); } catch (_) {}
+  }
+
   if (loginRes.statusCode === 403) {
-    // CF is blocking — likely need cf_clearance cookie which requires a JS challenge
-    // Log what cookies we have so user can debug
-    const cookieNames = seedCookies.map(c => c.name).join(', ');
-    throw new Error(`Cloudflare blocked login (403). Seed cookies: [${cookieNames}]. Missing cf_clearance.`);
+    throw new Error(`Login blocked (403) even after captcha. Body: ${loginRes.body.slice(0, 200)}`);
   }
   if (loginRes.statusCode === 401 || loginRes.statusCode === 422) {
     throw new Error(`Wrong credentials (${loginRes.statusCode}): ${responseData.message || ''}`);
@@ -302,6 +323,57 @@ async function fetchOtpForAccount(account) {
     if (saved.IMAP_PORT) process.env.IMAP_PORT = saved.IMAP_PORT;
     else delete process.env.IMAP_PORT;
   }
+}
+
+
+// ─── Capsolver: solve Turnstile (only called when captcha is detected) ────────
+const CAPSOLVER_API_KEY = process.env.CAPSOLVER_API_KEY
+  || 'CAP-D3066E7DCF80005676B3C5DD6C46CA7D4A28B0A9D857CD4E0A614155F83FC499';
+
+async function solveTurnstile() {
+  console.log('[Capsolver] Solving Turnstile...');
+
+  // Auto-detect site key from env or use Apollo's known key
+  const siteKey = process.env.TURNSTILE_SITE_KEY || '0x4AAAAAAADnPIDROrmt1Wwj';
+
+  const createBody = JSON.stringify({
+    clientKey: CAPSOLVER_API_KEY,
+    task: { type: 'AntiTurnstileTaskProxyLess', websiteURL: 'https://app.apollo.io', websiteKey: siteKey },
+  });
+
+  const createRes = await httpsJsonPost('api.capsolver.com', '/createTask', createBody);
+  if (createRes.errorId !== 0) throw new Error(`Capsolver: ${createRes.errorDescription}`);
+
+  const { taskId } = createRes;
+  const deadline = Date.now() + 120000;
+
+  while (Date.now() < deadline) {
+    await sleep(3000);
+    const poll = await httpsJsonPost('api.capsolver.com', '/getTaskResult',
+      JSON.stringify({ clientKey: CAPSOLVER_API_KEY, taskId }));
+    if (poll.status === 'ready') {
+      console.log('[Capsolver] ✓ Token ready');
+      return poll.solution.token;
+    }
+    if (poll.status === 'failed' || poll.errorId !== 0) throw new Error(`Capsolver: ${poll.errorDescription}`);
+  }
+  throw new Error('Capsolver timed out after 120s');
+}
+
+function httpsJsonPost(hostname, path, body) {
+  return new Promise((resolve, reject) => {
+    const req = require('https').request({
+      hostname, path, method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(body) },
+    }, res => {
+      let data = '';
+      res.on('data', c => data += c);
+      res.on('end', () => { try { resolve(JSON.parse(data)); } catch (_) { resolve({}); } });
+    });
+    req.on('error', reject);
+    req.write(body);
+    req.end();
+  });
 }
 
 // ─── Cookie helpers ───────────────────────────────────────────────────────────
